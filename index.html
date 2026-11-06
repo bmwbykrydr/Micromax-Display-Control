@@ -68,32 +68,35 @@ function onDisconnect(){writeChar=null;notifyChar=null;pending=null;editOn=false
 async function connect(){if(mode==='internet')return connectInternet();if(!navigator.bluetooth){log('Web Bluetooth unavailable. Use Android Chrome or Bluefy on iPhone, on an HTTPS page.',true);return;}try{device=await navigator.bluetooth.requestDevice({filters:[{services:[SERVICE]}],optionalServices:[SERVICE]});device.addEventListener('gattserverdisconnected',onDisconnect);const server=await device.gatt.connect();const svc=await server.getPrimaryService(SERVICE);writeChar=await svc.getCharacteristic(RX);notifyChar=await svc.getCharacteristic(TX);await notifyChar.startNotifications();notifyChar.addEventListener('characteristicvaluechanged',onNotify);log('BLE connected: '+(device.name||'Micromax')+'; checking command replies...');const test=await send('STATUS');state(true);log('Device responded: '+test);}catch(e){log(e.message||String(e),true);onDisconnect();}}
 function sendBle(command){
  const next=queue.catch(()=>{}).then(async()=>{
-  if(!writeChar||!notifyChar)throw Error('Bluetooth not connected');
+  if(!writeChar||!notifyChar||!device?.gatt?.connected)throw Error('Bluetooth not connected');
   if(encoder.encode(command).length>20)throw Error('Internal command exceeds 20-byte safe packet size');
   let pollTimer=null,pollBusy=false;
+  let request;
   const response=new Promise((resolve,reject)=>{
-   const timeout=setTimeout(()=>{if(pending){pending=null;reject(Error('No Bluetooth reply for '+command));}},9000);
-   pending={resolve,reject,timeout,command};
+   const timeout=setTimeout(()=>{
+    if(pending===request){pending=null;reject(Error('No Bluetooth reply for '+command));}
+   },9000);
+   request={resolve,reject,timeout,command};
+   pending=request;
   });
   try{
-   // Set pending BEFORE writing: the ESP32 can respond before writeValue resolves.
    if(writeChar.writeValueWithResponse)await writeChar.writeValueWithResponse(encoder.encode(command));
    else await writeChar.writeValue(encoder.encode(command));
-   // Windows/Chrome sometimes fails to deliver a notify callback even though
-   // the ESP32 has already written its reply to its READ|NOTIFY TX characteristic.
-   // Read that characteristic as a fallback while waiting for a notification.
+   // Read-back is a fallback only. Read the response for THIS request, never
+   // resolve a later request using an earlier asynchronous read.
    pollTimer=setInterval(async()=>{
-    if(!pending||pollBusy||!notifyChar)return;
+    if(pending!==request||pollBusy||!notifyChar)return;
     pollBusy=true;
     try{
      const value=await notifyChar.readValue();
      const msg=decoder.decode(value);
-     if(!pending||!msg||msg.startsWith('READY -'))return;
-     // Do not mistake an older GETPART offset (or previous command reply)
-     // for the response to the request currently in flight.
+     if(pending!==request||!msg||msg.startsWith('READY -'))return;
      if(!bleReplyMatches(command,msg))return;
-     if(msg){log('BLE reply retrieved by read-back: '+msg);const p=pending;pending=null;clearTimeout(p.timeout);p.resolve(msg);}
-    }catch(e){ /* A failed read does not prevent the normal notify or timeout. */ }
+     log('BLE reply retrieved by read-back: '+msg);
+     pending=null;
+     clearTimeout(request.timeout);
+     request.resolve(msg);
+    }catch(e){ /* Let notifications or timeout decide. */ }
     finally{pollBusy=false;}
    },550);
    const result=await response;
@@ -101,7 +104,7 @@ function sendBle(command){
    return result;
   }finally{
    if(pollTimer!==null)clearInterval(pollTimer);
-   if(pending){clearTimeout(pending.timeout);pending=null;}
+   if(pending===request){clearTimeout(request.timeout);pending=null;}
   }
  });
  queue=next;
@@ -110,7 +113,7 @@ function sendBle(command){
 function send(command){return mode==='internet'?sendInternet(command):sendBle(command)}
 function safe(fn){return async()=>{try{await fn();}catch(e){log(e.message||String(e),true);}};}
 function msgInput(n){return el('msg'+n);}
-async function readOne(n){log('READ message '+n+' requested via '+mode);let val='';for(let offset=0;offset<64;offset+=12){const result=await send(`GETPART ${n} ${offset}`);const prefix=`P${n}:${String(offset).padStart(2,'0')}:`;if(!result.startsWith(prefix))throw Error('Unexpected response '+result);const part=result.slice(prefix.length);val+=part;if(part.length<12)break;}msgInput(n).value=val;updateCount(n);log('Message '+n+' loaded');}
+async function readOne(n){log('READ message '+n+' requested via '+mode);let val='';for(let offset=0;offset<64;offset+=12){const result=await send(`GETPART ${n} ${offset}`);const prefix=`P${n}:${String(offset).padStart(2,'0')}:`;if(!result.startsWith(prefix))throw Error('Unexpected reply to GETPART '+n+' '+offset+': '+result);const part=result.slice(prefix.length);val+=part;if(part.length<12)break;}msgInput(n).value=val;updateCount(n);log('Message '+n+' loaded');}
 async function saveOne(n){log('SAVE message '+n+' requested via '+mode);let msg=msgInput(n).value.toUpperCase();if(msg.length>64)throw Error('Message '+n+' exceeds 64 characters');for(const ch of msg){if(!alphabet.includes(ch))throw Error('Unsupported character: '+ch);}if(mode==='internet' && msg.length===0){await send('CLEAR '+n);msgInput(n).value='';updateCount(n);log('Message '+n+' cleared and saved to controller');return;}await send('BEGIN '+n);try{const bytes=encoder.encode(msg);for(let offset=0;offset<bytes.length;offset+=6){const packet=Array.from(bytes.slice(offset,offset+6),x=>x.toString(16).padStart(2,'0')).join('').toUpperCase();await send('HEX '+packet);}await send('END');msgInput(n).value=msg;updateCount(n);log('Message '+n+' saved to controller');}catch(e){try{await send('ABORT');}catch(_){}throw e;}}
 function updateCount(n){el('count'+n).textContent=msgInput(n).value.length+'/64';}
 const msgs=el('messages');for(let n=1;n<=5;n++){const div=document.createElement('div');div.className='msgrow';div.innerHTML=`<div class="msghead"><label for="msg${n}">Message ${n}</label><span class="counter" id="count${n}">0/64</span></div><textarea id="msg${n}" maxlength="64" rows="2" spellcheck="false" placeholder="Message ${n} text"></textarea><div class="twobuttons"><button id="read${n}">READ ${n}</button><button class="primary" id="save${n}">SAVE ${n}</button></div>`;msgs.appendChild(div);msgInput(n).addEventListener('input',()=>updateCount(n));el('read'+n).onclick=safe(()=>readOne(n));el('save'+n).onclick=safe(()=>saveOne(n));const select=document.createElement('button');select.textContent=String(n);select.onclick=safe(()=>send('MSG '+n));el('selectors').appendChild(select);}
