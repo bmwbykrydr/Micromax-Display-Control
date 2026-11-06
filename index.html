@@ -7,7 +7,7 @@
 <section class="panel"><h2>Wi-Fi setup over Bluetooth</h2><p class="small">Scan nearby 2.4 GHz Wi-Fi networks, select a network or enter its SSID, type the password, then SAVE and CONNECT. The local hardware Wi-Fi wizard is still available.<br><br>Supported Wi-Fi character set: (space is first)<br>  AaBbCcDdEeFfGgHhIiJjKkLlMmNnOoPpQqRrSsTtUuVv<br>WwXxYyZz0123456789-!\"#$%&()*,./\\:;?@[]^_+<=></p><div class="actions"><button id="scanWifi" class="secondary">SCAN WI-FI</button><button id="refreshWifi">CHECK STATUS</button></div><div class="msgrow"><label for="wifiNetworks"><b>Nearby networks</b></label><select id="wifiNetworks" style="display:block;width:100%;padding:12px;margin-top:8px;border:1px solid #a6bdc6;border-radius:9px;background:white;color:#16333e"><option value="">Scan to find networks</option></select></div><div class="msgrow"><label for="wifiSSID"><b>Wi-Fi name (SSID)</b></label><input id="wifiSSID" maxlength="32" type="text" autocomplete="off" spellcheck="false" placeholder="Choose above or type network name" style="display:block;width:100%;padding:12px;margin-top:8px;border:1px solid #a6bdc6;border-radius:9px;background:white;color:#16333e"></div><div class="msgrow"><label for="wifiPassword"><b>Wi-Fi password</b></label><div style="display:flex;gap:8px;margin-top:8px"><input id="wifiPassword" maxlength="32" type="password" autocomplete="new-password" placeholder="Enter password (blank for open network)" style="flex:1;min-width:0;padding:12px;border:1px solid #a6bdc6;border-radius:9px;background:white;color:#16333e"><button id="showWifiPassword" type="button">SHOW</button></div><p class="small">Password is not displayed after saving. Wi-Fi names and passwords are transferred to the ESP32 via BLE, not to the hosting website.</p></div><div class="actions"><button id="saveWifi" class="primary">SAVE WI-FI</button><button id="connectWifi" class="secondary">CONNECT WI-FI</button></div><p class="small">Wi-Fi status: <b id="wifiState">Not checked</b></p></section>
 <section class="panel"><h2>Virtual buttons</h2><p class="small">Tap to simulate the original physical buttons. Turn EDIT on and select a message to use the manual editor. Direct message SAVE requires EDIT off.</p><div class="remote"><button data-tap="LEFT">◀ LEFT</button><button data-tap="SELECT">SELECT</button><button data-tap="RIGHT">RIGHT ▶</button><button data-long="LEFT">HOLD LEFT<br><small>Save / accept</small></button><button data-long="SELECT">HOLD SELECT<br><small>Auto cycle</small></button><button data-long="RIGHT">HOLD RIGHT<br><small>Clear prompt</small></button></div><div class="switchrow"><b>EDIT switch</b><button id="edit">EDIT OFF</button></div><div class="actions"><button id="statusButton">Check mode</button><button id="release">Release virtual controls</button></div><p class="small">During manual editing, choose a message using the buttons below.</p><div class="remote" style="grid-template-columns:repeat(5,minmax(0,1fr))" id="selectors"></div></section>
 <section class="panel"><h2>Retirement target</h2><p class="small">The new date is saved by the ESP32. Bluetooth and internet both support this setting.</p><input type="datetime-local" id="retireDate" step="1" style="padding:12px;border:1px solid #a6bdc6;border-radius:9px;max-width:100%"><div class="actions"><button id="saveRetire" class="primary">SAVE RETIREMENT DATE</button></div></section>
-<section class="panel"><h2>Connection activity</h2><pre id="activity" aria-live="polite">Ready. Choose Internet or Bluetooth, then connect. Connection diagnostics build 2.</pre><p class="small">Bluetooth communicates directly with a nearby ESP32. Internet uses a separate Micromax Firebase project.</p></section>
+<section class="panel"><h2>Connection activity</h2><pre id="activity" aria-live="polite">Ready. Choose Internet or Bluetooth, then connect. Bluetooth reply read-back fix (build 3).</pre><p class="small">Bluetooth communicates directly with a nearby ESP32. Internet uses a separate Micromax Firebase project.</p></section>
 <section class="panel"><h2>Compatibility</h2><p class="small">Android: Chrome on an HTTPS page. iPhone: Bluefy Web BLE Browser on an HTTPS page (Safari does not support Web Bluetooth). Wi-Fi provisioning, hold buttons, and the EDIT switch are available in Bluetooth mode. Internet mode supports message READ/SAVE, short button taps, and retirement date.</p></section></main>
 <script>
 'use strict';
@@ -30,10 +30,57 @@ function state(online){
  } 
  el('connect').textContent=mode==='internet'?'Connect Internet':'Connect Bluetooth';
 }
-function onNotify(e){const msg=decoder.decode(e.target.value);log('← '+msg);if(pending){const p=pending;pending=null;clearTimeout(p.timeout);p.resolve(msg);}}
+function onNotify(e){
+ const msg=decoder.decode(e.target.value);
+ if(msg.startsWith('READY -'))return; // Initial characteristic value is not a command reply.
+ log('← '+msg);
+ if(pending){const p=pending;pending=null;clearTimeout(p.timeout);p.resolve(msg);}
+}
 function onDisconnect(){writeChar=null;notifyChar=null;pending=null;editOn=false;el('edit').textContent='EDIT OFF';el('edit').classList.remove('switchon');state(false);log('Bluetooth disconnected');}
 async function connect(){if(mode==='internet')return connectInternet();if(!navigator.bluetooth){log('Web Bluetooth unavailable. Use Android Chrome or Bluefy on iPhone, on an HTTPS page.',true);return;}try{device=await navigator.bluetooth.requestDevice({filters:[{services:[SERVICE]}],optionalServices:[SERVICE]});device.addEventListener('gattserverdisconnected',onDisconnect);const server=await device.gatt.connect();const svc=await server.getPrimaryService(SERVICE);writeChar=await svc.getCharacteristic(RX);notifyChar=await svc.getCharacteristic(TX);await notifyChar.startNotifications();notifyChar.addEventListener('characteristicvaluechanged',onNotify);log('BLE connected: '+(device.name||'Micromax')+'; checking command replies...');const test=await send('STATUS');state(true);log('Device responded: '+test);}catch(e){log(e.message||String(e),true);onDisconnect();}}
-function sendBle(command){const next=queue.catch(()=>{}).then(async()=>{if(!writeChar)throw Error('Not connected');if(encoder.encode(command).length>20)throw Error('Internal command exceeds 20-byte safe packet size');let result;const response=new Promise((resolve,reject)=>{const timeout=setTimeout(()=>{pending=null;reject(Error('No Bluetooth reply for '+command));},7500);pending={resolve,reject,timeout};});try{if(writeChar.writeValueWithResponse)await writeChar.writeValueWithResponse(encoder.encode(command));else await writeChar.writeValue(encoder.encode(command));result=await response;}catch(e){if(pending){clearTimeout(pending.timeout);pending=null;}throw e;}if(result.startsWith('ERR'))throw Error(result);return result;});queue=next;return next;}
+function sendBle(command){
+ const next=queue.catch(()=>{}).then(async()=>{
+  if(!writeChar||!notifyChar)throw Error('Bluetooth not connected');
+  if(encoder.encode(command).length>20)throw Error('Internal command exceeds 20-byte safe packet size');
+  let pollTimer=null,pollBusy=false;
+  const response=new Promise((resolve,reject)=>{
+   const timeout=setTimeout(()=>{if(pending){pending=null;reject(Error('No Bluetooth reply for '+command));}},9000);
+   pending={resolve,reject,timeout};
+  });
+  try{
+   // Set pending BEFORE writing: the ESP32 can respond before writeValue resolves.
+   if(writeChar.writeValueWithResponse)await writeChar.writeValueWithResponse(encoder.encode(command));
+   else await writeChar.writeValue(encoder.encode(command));
+   // Windows/Chrome sometimes fails to deliver a notify callback even though
+   // the ESP32 has already written its reply to its READ|NOTIFY TX characteristic.
+   // Read that characteristic as a fallback while waiting for a notification.
+   pollTimer=setInterval(async()=>{
+    if(!pending||pollBusy||!notifyChar)return;
+    pollBusy=true;
+    try{
+     const value=await notifyChar.readValue();
+     const msg=decoder.decode(value);
+     if(!pending||!msg||msg.startsWith('READY -'))return;
+     // Ignore the original characteristic value if it clearly belongs to a
+     // different command. In particular STATUS must return MODE, not stale OK.
+     if(command==='STATUS'&&!msg.startsWith('MODE '))return;
+     if(command.startsWith('GETPART ')&&!msg.startsWith('P'))return;
+     if(command==='WCOUNT'&&!(/^(COUNT |SCANNING)/.test(msg)))return;
+     if(msg){log('BLE reply retrieved by read-back: '+msg);const p=pending;pending=null;clearTimeout(p.timeout);p.resolve(msg);}
+    }catch(e){ /* A failed read does not prevent the normal notify or timeout. */ }
+    finally{pollBusy=false;}
+   },550);
+   const result=await response;
+   if(result.startsWith('ERR'))throw Error(result);
+   return result;
+  }finally{
+   if(pollTimer!==null)clearInterval(pollTimer);
+   if(pending){clearTimeout(pending.timeout);pending=null;}
+  }
+ });
+ queue=next;
+ return next;
+}
 function send(command){return mode==='internet'?sendInternet(command):sendBle(command)}
 function safe(fn){return async()=>{try{await fn();}catch(e){log(e.message||String(e),true);}};}
 function msgInput(n){return el('msg'+n);}
