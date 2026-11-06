@@ -30,11 +30,39 @@ function state(online){
  } 
  el('connect').textContent=mode==='internet'?'Connect Internet':'Connect Bluetooth';
 }
+// A characteristic can still contain the preceding reply when Chrome reads it.
+// Match the message number AND offset for GETPART, not merely its initial P.
+function bleReplyMatches(command,msg){
+ if(!msg || msg.startsWith('READY -'))return false;
+ const get=/^GETPART ([1-5]) (\d+)$/.exec(command);
+ if(get)return msg.startsWith(`P${get[1]}:${String(Number(get[2])).padStart(2,'0')}:`) || msg.startsWith('ERR ');
+ if(command==='STATUS')return msg.startsWith('MODE ') || msg.startsWith('ERR ');
+ if(command==='WCOUNT')return /^(COUNT |SCANNING|ERR )/.test(msg);
+ if(command.startsWith('WNAME ')){
+  const m=/^WNAME (\d+) (\d+)$/.exec(command);
+  return !!m && (msg.startsWith(`N${m[1].padStart(2,'0')}:${String(Number(m[2])).padStart(2,'0')}:`) || msg.startsWith('ERR '));
+ }
+ // Other commands are acknowledged with OK/ERR, or a specific status.
+ if(command==='WSTATUS')return msg.startsWith('WIFI ') || msg.startsWith('ERR ');
+ if(command==='WSCAN')return msg.startsWith('OK SCANNING') || msg.startsWith('ERR ');
+ if(command.startsWith('WBEGIN '))return msg.startsWith('OK WBEGIN') || msg.startsWith('ERR ');
+ if(command.startsWith('WHEX '))return msg.startsWith('OK WHEX') || msg.startsWith('ERR ');
+ if(command==='WEND')return msg.startsWith('OK WSTAGED') || msg.startsWith('ERR ');
+ if(command==='WSAVE')return msg.startsWith('OK WIFI SAVED') || msg.startsWith('ERR ');
+ if(command==='WCONNECT')return msg.startsWith('OK CONNECTING') || msg.startsWith('ERR ');
+ if(command.startsWith('BEGIN '))return msg.startsWith('OK BEGIN') || msg.startsWith('ERR ');
+ if(command.startsWith('HEX '))return msg.startsWith('OK HEX') || msg.startsWith('ERR ');
+ if(command==='END')return msg.startsWith('OK SAVED MSG') || msg.startsWith('ERR ');
+ if(command==='ABORT')return msg.startsWith('OK ABORT') || msg.startsWith('ERR ');
+ return msg.startsWith('OK ') || msg.startsWith('ERR ');
+}
 function onNotify(e){
  const msg=decoder.decode(e.target.value);
- if(msg.startsWith('READY -'))return; // Initial characteristic value is not a command reply.
+ if(msg.startsWith('READY -'))return;
  log('← '+msg);
- if(pending){const p=pending;pending=null;clearTimeout(p.timeout);p.resolve(msg);}
+ if(pending && bleReplyMatches(pending.command,msg)){
+  const p=pending;pending=null;clearTimeout(p.timeout);p.resolve(msg);
+ }
 }
 function onDisconnect(){writeChar=null;notifyChar=null;pending=null;editOn=false;el('edit').textContent='EDIT OFF';el('edit').classList.remove('switchon');state(false);log('Bluetooth disconnected');}
 async function connect(){if(mode==='internet')return connectInternet();if(!navigator.bluetooth){log('Web Bluetooth unavailable. Use Android Chrome or Bluefy on iPhone, on an HTTPS page.',true);return;}try{device=await navigator.bluetooth.requestDevice({filters:[{services:[SERVICE]}],optionalServices:[SERVICE]});device.addEventListener('gattserverdisconnected',onDisconnect);const server=await device.gatt.connect();const svc=await server.getPrimaryService(SERVICE);writeChar=await svc.getCharacteristic(RX);notifyChar=await svc.getCharacteristic(TX);await notifyChar.startNotifications();notifyChar.addEventListener('characteristicvaluechanged',onNotify);log('BLE connected: '+(device.name||'Micromax')+'; checking command replies...');const test=await send('STATUS');state(true);log('Device responded: '+test);}catch(e){log(e.message||String(e),true);onDisconnect();}}
@@ -45,7 +73,7 @@ function sendBle(command){
   let pollTimer=null,pollBusy=false;
   const response=new Promise((resolve,reject)=>{
    const timeout=setTimeout(()=>{if(pending){pending=null;reject(Error('No Bluetooth reply for '+command));}},9000);
-   pending={resolve,reject,timeout};
+   pending={resolve,reject,timeout,command};
   });
   try{
    // Set pending BEFORE writing: the ESP32 can respond before writeValue resolves.
@@ -61,11 +89,9 @@ function sendBle(command){
      const value=await notifyChar.readValue();
      const msg=decoder.decode(value);
      if(!pending||!msg||msg.startsWith('READY -'))return;
-     // Ignore the original characteristic value if it clearly belongs to a
-     // different command. In particular STATUS must return MODE, not stale OK.
-     if(command==='STATUS'&&!msg.startsWith('MODE '))return;
-     if(command.startsWith('GETPART ')&&!msg.startsWith('P'))return;
-     if(command==='WCOUNT'&&!(/^(COUNT |SCANNING)/.test(msg)))return;
+     // Do not mistake an older GETPART offset (or previous command reply)
+     // for the response to the request currently in flight.
+     if(!bleReplyMatches(command,msg))return;
      if(msg){log('BLE reply retrieved by read-back: '+msg);const p=pending;pending=null;clearTimeout(p.timeout);p.resolve(msg);}
     }catch(e){ /* A failed read does not prevent the normal notify or timeout. */ }
     finally{pollBusy=false;}
